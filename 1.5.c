@@ -56,7 +56,7 @@ Program Flow
 
 #include <Arduino.h>
 #include <OneWire.h>
-#include "WatchDog.h"
+#include <avr/wdt.h>
 
 OneWire  ds(8);
 uint8_t wireAddr[8]; // address of 1-wire temperature sensor
@@ -67,7 +67,6 @@ int32_t temp = 2000; // current temperature centi°C
 int32_t pwm = 0; // 0-255 heater power; int16 for PID calc convenience
 volatile bool PID_Tick = true;
 volatile int8_t dispHold = 0;
-volatile int8_t UI_Input = 0;
 
 constexpr uint32_t MAX_SET_POINT             = 120 * 100;
 constexpr uint32_t MIN_SET_POINT             =   0 * 100;
@@ -84,13 +83,12 @@ ISR(TIMER1_COMPA_vect){
     }
 }
 
-
 ISR(TIMER2_COMPA_vect){
 
     // Display Update Section
     //                                   0     1     2     3     4     5     6     7     8     9     [ ]   E   
-    const uint8_t digitSegments_C[11] = {0x1F, 0x10, 0x2B, 0x39, 0x34, 0x3D, 0x3F, 0x11, 0x3F, 0x35, 0x00, 0x3D};
-    const uint8_t digitSegments_D[11] = {0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00, 0x40, 0x40, 0x40, 0x00, 0x00};
+    const uint8_t digitSegments_C[12] = {0x1F, 0x10, 0x2B, 0x39, 0x34, 0x3D, 0x3F, 0x11, 0x3F, 0x35, 0x00, 0x2F};
+    const uint8_t digitSegments_D[12] = {0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00, 0x40, 0x40, 0x40, 0x00, 0x00};
     const uint8_t digitPlacements[4]  = {0x80, 0x08, 0x10, 0x04};
     static uint8_t index = 0;
 
@@ -98,55 +96,18 @@ ISR(TIMER2_COMPA_vect){
     PORTC = digitSegments_C[value];
     PORTD = digitSegments_D[value] | digitPlacements[index];
     index == 3 ? index = 0 : index++;
-
-
-
-    // Rotary Input Section
-
-    static uint8_t state = 0;
-    static bool dir = 0;
-    uint8_t input = PINB & 0x18;
-
-    if(input != 0x18){ // some unstable state (not at bottom rest position)
-        switch (input){
-            case 0x00: //top
-                state |= 0x04;
-                break;
-            case 0x08: //set case 2
-                state |= 0x02;
-                dir = HIGH;
-                break;
-            case 0x10: //set case 1
-                state |= 0x01;
-                dir = LOW;
-                break;
-        }
-    }
-    else{ // rest state
-        if(state == 0x07){ // we have a tick
-            if(dir){
-                UI_Input += 10; // swap these to change rotary direction
-            }
-            else{
-                UI_Input -= 10;
-            }
-        }
-        state = 0; // clear the state regardless of a tick or not
-    }
 }
 
-void setDigit(uint8_t digit, uint8_t value){
-    fbuf[digit] = value;
-}
 
+// Accepts integer for display
 void setInt(uint32_t value){
-    value = constrain(value, 0, 15000);
-    uint8_t h = value / 1000;
+    value = constrain(value, 0, 150);
+    uint8_t h = value / 100;
 
-    fbuf[1] = h ? h : 10;
-    fbuf[3] = value % 100;
-    uint8_t t = (value / 100) % 10;
-    fbuf[2] = t ? t : 10;
+    fbuf[1] = h ? h : 10; // if hundreds is zero put a space (10)
+    fbuf[3] = value % 10; // singles
+    uint8_t t = (value / 10) % 10; // tens
+    fbuf[2] = t ? t : 10; // handle < 10°C
 }
 
 void error(int8_t errno){
@@ -166,14 +127,11 @@ void error(int8_t errno){
         wdt_reset();
     }
     // display error number:
-
-    // 0 - out of range error number
+    // 0 - out of range error number (not sure how)
     // 1 - multiple temperature sensor mis-reads
     // 2 - watchdog timer reset
     // 3 - heater drain low when MOSFET is switched off
     // 4 - heater drain high when MOSFET is switched on
-
-
 }
 
 int32_t updateTemp(){
@@ -205,7 +163,7 @@ void PID(){
     PORTD &= 0xDF;
     wdt_reset();
 
-    temp = updateTemp(true);
+    temp = updateTemp();
     // if we have a valid measurement do the PID stuff; change this to CRC check and/or(?)
     if((temp > LOWEST_VALID_MEASUREMENT) && (temp < HIGHEST_VALID_MEASUREMENT)){
 
@@ -278,6 +236,43 @@ void PID(){
 
 }
 
+int16_t rotary(){
+    // Rotary Input Section
+
+    static uint8_t state = 0;
+    static bool dir = 0;
+    uint8_t input = PINB & 0x18;
+    int16_t output = 0;
+
+    if(input != 0x18){ // some unstable state (not at bottom rest position)
+        switch (input){
+            case 0x00: //top
+                state |= 0x04;
+                break;
+            case 0x08: //set case 2
+                state |= 0x02;
+                dir = HIGH;
+                break;
+            case 0x10: //set case 1
+                state |= 0x01;
+                dir = LOW;
+                break;
+        }
+    }
+    else{ // rest state
+        if(state == 0x07){ // we have a tick
+            if(dir){
+                output += 100; // swap these to change rotary direction
+            }
+            else{
+                output -= 100;
+            }
+        }
+        state = 0; // clear the state regardless of a tick or not
+    }
+    return output;
+}
+
 void startupTest(){
     // check mosfet and temperature sensor and reboot reason
 
@@ -300,17 +295,12 @@ void startupTest(){
     if(digitalRead(9) == HIGH){
         error(4); // terminates
     }
-
-
-
-
-
 }
 
 
 
-
 void setup(){
+    Serial.begin(115200);
     // get address of 1-wire sensor and request temp update
     ds.search(wireAddr);
     ds.reset();
@@ -318,7 +308,7 @@ void setup(){
     ds.write(0x44, 1);
     delay(750);
 
-    startupTest();
+    //startupTest();
 
     DDRC = 0x3F; //all of PORTC to OUTPUT for LEDs
     DDRD = 0xFC; //all except Serial pins 1111 1100; LED cathode transistors and PWM
@@ -346,8 +336,8 @@ void setup(){
     OCR2A = 255; // 16 MHz / 256 / 100 -> 625 Hz
     TIMSK2 = bit(OCIE2A);
 
-    setDigit(0,10); // clear left-most digit; not in use currently
-    setInt(setPoint/10); // show the set point (deci°C)
+    fbuf[0] = 10; // clear left-most digit; not in use currently
+    setInt(setPoint / 100); // show the set point
 
 
     // config watchdog
@@ -356,12 +346,7 @@ void setup(){
     WDTCSR = bit(WDE) | bit(WDP3); // 4s timeout to reset
     wdt_reset();
 
-
     interrupts(); // for both PID and Display
-
-
-
-
 }
 
 void loop(){
@@ -370,20 +355,20 @@ void loop(){
         PID();
         PID_Tick = false;
         if(dispHold == 0){ // countdown ticker that prevents the current temperature from immediately overwritting user input set point
-            setInt(temp);
+            setInt(temp / 100);
         }
     }
 
-    if(UI_Input){
-        setPoint += UI_Input;
-        UI_Input = 0;
+    int16_t userInput = rotary();
+    if(userInput){
+        setPoint += userInput;
         if(setPoint < MIN_SET_POINT){
             setPoint = MIN_SET_POINT;
         }
         if(setPoint > MAX_SET_POINT){
             setPoint = MAX_SET_POINT;
             }
-        setInt(setPoint);
+        setInt(setPoint / 100);
         dispHold = 3; // holds the setpoint briefly before resuming current temp updates
     }
     
